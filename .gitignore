@@ -1,0 +1,8 @@
+# IDE
+.vs/
+.vscode/
+
+# ESP-IDF build output
+build/
+sdkconfig.old
+managed_components/
