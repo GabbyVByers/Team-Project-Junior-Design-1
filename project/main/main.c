@@ -16,20 +16,9 @@ void app_main(void)
   while (true) {
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    while (imu_has_data()) {
-      imu_receive_packet();
-    }
-
-    float w = imu_data.w;
-    float x = imu_data.x;
-    float y = imu_data.y;
-    float z = imu_data.z;
-
-    float ax = imu_data.ax;
-    float ay = imu_data.ay;
-    float az = imu_data.az;
-
-    printf("Quat: [%6.3f, %6.3f, %6.3f, %6.3f] Acc: [%6.2f %6.2f %6.2f]\n", w, x, y, z, ax, ay, az);
+    imu_data_t d = imu_read();
+    printf("Quat: [%6.3f, %6.3f, %6.3f, %6.3f] Acc: [%6.2f %6.2f %6.2f]\n",
+           d.w, d.x, d.y, d.z, d.ax, d.ay, d.az);
   }
 }
 
