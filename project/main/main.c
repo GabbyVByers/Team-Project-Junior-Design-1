@@ -6,19 +6,18 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "imu.h"
+#include "lidar.h"
 
 void app_main(void)
 {
-  imu_init();
-  printf("IMU Ready\n");
+  lidar_init();
+  printf("Lidar Ready\n");
 
   while (true) {
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    imu_data_t d = imu_read();
-    printf("Quat: [%6.3f, %6.3f, %6.3f, %6.3f] Acc: [%6.2f %6.2f %6.2f]\n",
-           d.w, d.x, d.y, d.z, d.ax, d.ay, d.az);
+    lidar_data_t d = lidar_read();
+    printf("Dist: %4d cm  Amp: %5d  Temp: %.1f C\n",
+           d.distance_cm, d.amplitude, d.temp_c);
   }
 }
-
