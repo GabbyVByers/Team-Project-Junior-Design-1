@@ -1,7 +1,6 @@
 # IDE
 .vs/
 .vscode/
-.claude/
 
 # ESP-IDF build output
 build/
