@@ -1,8 +1,12 @@
 # IDE
 .vs/
 .vscode/
+.claude/
 
 # ESP-IDF build output
 build/
 sdkconfig.old
 managed_components/
+
+# WiFi credentials
+project/main/secrets.h

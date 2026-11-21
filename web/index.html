@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>ESP32 Counter</title>
+  <style>
+    body { font-family: sans-serif; text-align: center; margin-top: 20vh; }
+    #counter { font-size: 6rem; font-variant-numeric: tabular-nums; }
+    #status { color: gray; }
+  </style>
+</head>
+<body>
+  <div id="counter">--</div>
+  <div id="status">Connecting...</div>
+
+  <script>
+    const ESP32_IP = "192.168.1.224";  // paste the IP printed on the serial monitor
+
+    const counter = document.getElementById("counter");
+    const status = document.getElementById("status");
+    const ws = new WebSocket(`ws://${ESP32_IP}/ws`);
+
+    ws.onopen    = () => status.textContent = "Connected";
+    ws.onclose   = () => status.textContent = "Disconnected - refresh to retry";
+    ws.onmessage = (e) => counter.textContent = e.data;
+  </script>
+</body>
+</html>
