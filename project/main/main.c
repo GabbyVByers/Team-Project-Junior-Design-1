@@ -3,9 +3,6 @@
  *   Source [main.c]
  */
 
-#define IMU_DEMO
-#ifdef IMU_DEMO
-
 #include <stdio.h>
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
@@ -13,6 +10,7 @@
 #include "driver/gpio.h"
 #include "imu.h"
 #include "calibration.h"
+#include "lidar.h"
 #include "web.h"
 
 #define PIN_LED_CALIBRATING GPIO_NUM_4
@@ -21,6 +19,9 @@
 
 #define SEND_EVERY  4   // samples (25 Hz at the IMU's 100 Hz)
 #define PRINT_EVERY 10  // samples (10 Hz)
+
+#define LIDAR_MIN_AMPLITUDE 100    // TF-Luna: weaker returns are unreliable
+#define LIDAR_BAD_AMPLITUDE 65535  // TF-Luna: overexposed
 
 static void show_ready(bool ready)
 {
@@ -63,6 +64,7 @@ void app_main(void)
 	bool calibrate_sensor = gpio_get_level(PIN_BUTTON_HALT) == 0;
 
 	web_init();
+	lidar_init();
 	imu_init();
 
 	if (calibrate_sensor) {
@@ -78,39 +80,20 @@ void app_main(void)
 		vec3_t p = pose.position;
 		quat_t q = pose.orientation;
 
+		lidar_data_t lidar = lidar_read();
+		bool lidar_valid = lidar.distance_cm > 0 && lidar.amplitude >= LIDAR_MIN_AMPLITUDE && lidar.amplitude != LIDAR_BAD_AMPLITUDE;
+		float distance = lidar_valid ? lidar.distance_cm / 100.0f : 0;  // m; 0 = no valid reading
+
 		if (n % SEND_EVERY == 0) {
-			// "px py pz qw qx qy qz", parsed by web/index.html
-			char text[96];
-			snprintf(text, sizeof(text), "%.4f %.4f %.4f %.4f %.4f %.4f %.4f", p.x, p.y, p.z, q.w, q.x, q.y, q.z);
+			// "px py pz qw qx qy qz d", parsed by web/script.js
+			char text[112];
+			snprintf(text, sizeof(text), "%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.2f", p.x, p.y, p.z, q.w, q.x, q.y, q.z, distance);
 			web_broadcast(text);
 		}
 
 		if (n % PRINT_EVERY == 0) {
-			printf("Pos: x=%.3f y=%.3f z=%.3f m | Quat: w=%.4f x=%.4f y=%.4f z=%.4f\n", p.x, p.y, p.z, q.w, q.x, q.y, q.z);
+			printf("Pos: x=%.3f y=%.3f z=%.3f m | Quat: w=%.4f x=%.4f y=%.4f z=%.4f | Dist: %.2f m\n",
+				p.x, p.y, p.z, q.w, q.x, q.y, q.z, distance);
 		}
 	}
 }
-
-#endif /* IMU_DEMO */
-
-
-
-// #define LIDAR_DEMO
-#ifdef LIDAR_DEMO
-
-#include <stdio.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "lidar.h"
-
-void app_main(void)
-{
-	lidar_init();
-
-	while (true) {
-		vTaskDelay(pdMS_TO_TICKS(100));
-		printf("Distance: %d cm\n", lidar_read().distance_cm);
-	}
-}
-
-#endif /* LIDAR_DEMO */
