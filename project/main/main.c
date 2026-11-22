@@ -3,9 +3,33 @@
  *   Source [main.c]
  */
 
+/* -------------------- IMU -------------------- */
+
+#define IMU_DEMO
+#ifdef IMU_DEMO
+
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "imu.h"
+
+void app_main(void)
+{
+  imu_init();
+  
+  while (true) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+    imu_data_t d = imu_read();
+    printf("Quat: w=%.3f x=%.3f y=%.3f z=%.3f | Accel: x=%.2f y=%.2f z=%.2f m/s^2\n",
+      d.w, d.x, d.y, d.z, d.ax, d.ay, d.az);
+  }
+}
+
+#endif /* IMU_DEMO */
+
 /* -------------------- LIDAR -------------------- */
 
-#define LIDAR_DEMO
+// #define LIDAR_DEMO
 #ifdef LIDAR_DEMO
 
 #include <stdio.h>
