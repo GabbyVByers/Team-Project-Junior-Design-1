@@ -8,12 +8,16 @@
 
 #include <stdio.h>
 #include <stdbool.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "driver/gpio.h"
 #include "imu.h"
+#include "calibration.h"
 #include "web.h"
 
 #define PIN_LED_CALIBRATING GPIO_NUM_4
 #define PIN_LED_READY       GPIO_NUM_2
+#define PIN_BUTTON_HALT     GPIO_NUM_32  // external pull-up; reads 0 while pressed
 
 #define SEND_EVERY  4   // samples (25 Hz at the IMU's 100 Hz)
 #define PRINT_EVERY 10  // samples (10 Hz)
@@ -22,6 +26,21 @@ static void show_ready(bool ready)
 {
 	gpio_set_level(PIN_LED_CALIBRATING, !ready);
 	gpio_set_level(PIN_LED_READY, ready);
+}
+
+static void blink_calibrating(int times)
+{
+	for (int i = 0; i < times; i++) {
+		gpio_set_level(PIN_LED_CALIBRATING, 0);
+		vTaskDelay(pdMS_TO_TICKS(150));
+		gpio_set_level(PIN_LED_CALIBRATING, 1);
+		vTaskDelay(pdMS_TO_TICKS(150));
+	}
+}
+
+static void on_pose_captured(void)
+{
+	blink_calibrating(1);
 }
 
 void app_main(void)
@@ -33,8 +52,24 @@ void app_main(void)
 	gpio_config(&led_cfg);
 	show_ready(false);
 
+	gpio_config_t button_cfg = {
+		.pin_bit_mask = 1ULL << PIN_BUTTON_HALT,
+		.mode = GPIO_MODE_INPUT,
+	};
+	gpio_config(&button_cfg);
+
+	// Holding HALT/STOP through a reset runs the sensor calibration sweep before the usual
+	// at-rest calibration
+	bool calibrate_sensor = gpio_get_level(PIN_BUTTON_HALT) == 0;
+
 	web_init();
 	imu_init();
+
+	if (calibrate_sensor) {
+		blink_calibrating(3);
+		calibration_run(on_pose_captured);
+	}
+
 	imu_calibrate();
 	show_ready(true);
 

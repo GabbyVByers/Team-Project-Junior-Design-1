@@ -6,6 +6,7 @@
 #include "imu.h"
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,8 +20,10 @@
 #define PIN_RESET      GPIO_NUM_19
 
 #define I2C_ADDRESS    0x4A
-#define I2C_SPEED_HZ   400000  // board has 4.7k pull-ups
+#define I2C_SPEED_HZ   100000
 #define I2C_TIMEOUT_MS 100
+#define I2C_STRETCH_US 13000   // the hub stretches the clock while it prepares data; the ESP32
+                               // driver's default limit (2 ms) is too short. ~13.1 ms is the max.
 
 #define REPORT_INTERVAL_US 10000  // 100 Hz
 
@@ -30,8 +33,14 @@
 #define CHANNEL_CONTROL    2
 #define CHANNEL_REPORTS    3
 
-#define CMD_SET_FEATURE    0xFD
-#define EXEC_RESET_DONE    0x01
+#define REPORT_COMMAND_RESPONSE 0xF1
+#define REPORT_COMMAND_REQUEST  0xF2
+#define CMD_SET_FEATURE         0xFD
+#define COMMAND_SAVE_DCD        0x06
+#define COMMAND_ME_CALIBRATION  0x07
+#define EXEC_RESET_DONE         0x01
+
+#define COMMAND_TIMEOUT_MS 1000
 
 #define REPORT_ACCELEROMETER    0x01
 #define REPORT_GAME_ROTATION    0x08
@@ -54,15 +63,11 @@
 #define JITTER_SMOOTHING      0.1f   // per-sample weight of the short-term average
 #define GRAVITY_TRACKING_RATE 0.02f  // per-sample weight for re-measuring gravity while stationary
 
-typedef struct {
-	quat_t orientation;  // device -> world (game rotation vector: gravity-aligned, no magnetometer),
-	                     // interpolated to the moment the acceleration was measured
-	vec3_t accel;        // calibrated accelerometer (gravity included), device frame, m/s^2
-	float dt;            // seconds since the previous sample, from the hub's timestamps
-} imu_sample_t;
-
 static i2c_master_dev_handle_t device;
+static uint8_t control_sequence;  // SHTP sequence number for packets we send on the control channel
 static bool reset_done;
+static int command_response = -1;  // command ID of the last command response received
+static uint8_t command_status;
 static volatile int64_t interrupt_time_us;  // when the hub last raised INT
 
 // The two most recent orientations, and accel readings waiting for an orientation newer than them
@@ -72,6 +77,7 @@ static vec3_t pending_accel[PENDING_SIZE];
 static int64_t pending_accel_us[PENDING_SIZE];
 static int pending_count;
 static int64_t last_sample_us;
+static quat_t last_sample_orientation;
 
 static imu_sample_t sample_queue[QUEUE_SIZE];
 static int queue_head, queue_count;
@@ -82,7 +88,6 @@ static vec3_t gravity;          // accelerometer reading at rest, level frame (i
 static imu_pose_t pose;
 static vec3_t velocity, prev_accel;
 static vec3_t accel_average;  // short-term average of the raw reading, device frame
-static quat_t prev_orientation;
 static float still_time;
 
 static quat_t quat_multiply(quat_t a, quat_t b)
@@ -155,16 +160,23 @@ static void queue_sample(int64_t time_us, vec3_t accel)
 
 	if (last_sample_us == 0) {
 		last_sample_us = time_us;
+		last_sample_orientation = orientation;
 		return;
 	}
 	if (queue_count == QUEUE_SIZE) { return; }
 
+	float dt = (time_us - last_sample_us) * 1e-6f;
+	quat_t step = quat_multiply(quat_conjugate(last_sample_orientation), orientation);
+	float angle = 2.0f * vec_length((vec3_t){ step.x, step.y, step.z });
+
 	sample_queue[(queue_head + queue_count++) % QUEUE_SIZE] = (imu_sample_t){
 		.orientation = orientation,
 		.accel = accel,
-		.dt = (time_us - last_sample_us) * 1e-6f,
+		.angular_rate = (dt > 0) ? angle / dt : 0,
+		.dt = dt,
 	};
 	last_sample_us = time_us;
+	last_sample_orientation = orientation;
 }
 
 static void on_accel(int64_t time_us, vec3_t accel)
@@ -271,6 +283,9 @@ static void receive_packet(void)
 
 	if (channel == CHANNEL_REPORTS) {
 		parse_reports(payload, payload_length, packet_interrupt_us);
+	} else if (channel == CHANNEL_CONTROL && payload_length >= 6 && payload[0] == REPORT_COMMAND_RESPONSE) {
+		command_response = payload[2] & 0x7F;
+		command_status = payload[5];  // R0
 	} else if (channel == CHANNEL_EXECUTABLE && payload[0] == EXEC_RESET_DONE) {
 		reset_done = true;
 	}
@@ -285,24 +300,48 @@ static void receive_or_wait(void)
 	}
 }
 
+static void send_control(const uint8_t *payload, int length)
+{
+	uint8_t packet[SHTP_HEADER_SIZE + 17] = { 0 };
+	packet[0] = SHTP_HEADER_SIZE + length;
+	packet[2] = CHANNEL_CONTROL;
+	packet[3] = control_sequence++;
+	memcpy(&packet[SHTP_HEADER_SIZE], payload, length);
+
+	i2c_master_transmit(device, packet, SHTP_HEADER_SIZE + length, I2C_TIMEOUT_MS);
+}
+
 static void enable_report(uint8_t report_id, uint32_t interval_us)
 {
-	static uint8_t sequence = 0;
-	uint8_t packet[SHTP_HEADER_SIZE + 17] = { 0 };
-
-	packet[0] = sizeof(packet);
-	packet[2] = CHANNEL_CONTROL;
-	packet[3] = sequence++;
-
-	uint8_t *cmd = &packet[SHTP_HEADER_SIZE];
-	cmd[0] = CMD_SET_FEATURE;
-	cmd[1] = report_id;
+	uint8_t cmd[17] = { CMD_SET_FEATURE, report_id };
 	cmd[5] = interval_us & 0xFF;
 	cmd[6] = (interval_us >> 8) & 0xFF;
 	cmd[7] = (interval_us >> 16) & 0xFF;
 	cmd[8] = (interval_us >> 24) & 0xFF;
+	send_control(cmd, sizeof(cmd));
+}
 
-	i2c_master_transmit(device, packet, sizeof(packet), I2C_TIMEOUT_MS);
+// Sends an SH-2 command request (P0-P8 in params) and waits for its response; returns R0 (status)
+// or -1 on timeout. Sensor reports that arrive meanwhile are still queued as usual.
+static int run_command(uint8_t command, const uint8_t params[9])
+{
+	static uint8_t command_sequence;
+	uint8_t request[12] = { REPORT_COMMAND_REQUEST, command_sequence++, command };
+	memcpy(&request[3], params, 9);
+
+	command_response = -1;
+	send_control(request, sizeof(request));
+
+	for (int waited = 0; command_response != command; ) {
+		if (waited >= pdMS_TO_TICKS(COMMAND_TIMEOUT_MS)) { return -1; }
+		if (packet_pending()) {
+			receive_packet();
+		} else {
+			vTaskDelay(1);
+			waited++;
+		}
+	}
+	return command_status;
 }
 
 static void setup_gpio(void)
@@ -342,6 +381,7 @@ static void setup_i2c(void)
 		.dev_addr_length = I2C_ADDR_BIT_LEN_7,
 		.device_address = I2C_ADDRESS,
 		.scl_speed_hz = I2C_SPEED_HZ,
+		.scl_wait_us = I2C_STRETCH_US,
 	};
 	ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &dev_cfg, &device));
 }
@@ -363,7 +403,7 @@ void imu_init(void)
 	enable_report(REPORT_ACCELEROMETER, REPORT_INTERVAL_US);
 }
 
-static imu_sample_t next_sample(void)
+imu_sample_t imu_next_sample(void)
 {
 	while (queue_count == 0) {
 		receive_or_wait();
@@ -378,7 +418,7 @@ static imu_sample_t next_sample(void)
 void imu_calibrate(void)
 {
 	for (float t = 0; t < SETTLE_TIME_S; ) {
-		t += next_sample().dt;
+		t += imu_next_sample().dt;
 	}
 
 	// Average orientation and the accelerometer reading in the world frame (gravity plus bias) at rest
@@ -387,7 +427,7 @@ void imu_calibrate(void)
 	int count = 0;
 
 	for (float t = 0; t < CALIBRATION_TIME_S; count++) {
-		imu_sample_t sample = next_sample();
+		imu_sample_t sample = imu_next_sample();
 		t += sample.dt;
 		accel_average = sample.accel;
 
@@ -408,13 +448,12 @@ void imu_calibrate(void)
 
 	pose = (imu_pose_t){ .orientation = quat_multiply(heading_inverse, baseline) };
 	velocity = prev_accel = (vec3_t){ 0 };
-	prev_orientation = baseline;
 	still_time = 0;
 }
 
 imu_pose_t imu_update(void)
 {
-	imu_sample_t sample = next_sample();
+	imu_sample_t sample = imu_next_sample();
 	float dt = sample.dt;
 	if (dt <= 0) { return pose; }
 
@@ -424,16 +463,11 @@ imu_pose_t imu_update(void)
 	pose.orientation = quat_multiply(heading_inverse, sample.orientation);
 	vec3_t accel = vec_sub(quat_rotate(pose.orientation, sample.accel), gravity);
 
-	// Angular rate from the change in orientation since the last sample
-	quat_t step = quat_multiply(quat_conjugate(prev_orientation), sample.orientation);
-	float angular_rate = 2.0f * vec_length((vec3_t){ step.x, step.y, step.z }) / dt;
-	prev_orientation = sample.orientation;
-
 	accel_average = vec_add(accel_average, vec_scale(vec_sub(sample.accel, accel_average), JITTER_SMOOTHING));
 	float jitter = vec_length(vec_sub(sample.accel, accel_average));
 	float g_error = fabsf(vec_length(sample.accel) - vec_length(gravity));
 
-	bool still_now = jitter < STILL_MAX_JITTER && g_error < STILL_MAX_G_ERROR && angular_rate < STILL_MAX_RATE;
+	bool still_now = jitter < STILL_MAX_JITTER && g_error < STILL_MAX_G_ERROR && sample.angular_rate < STILL_MAX_RATE;
 	still_time = still_now ? still_time + dt : 0;
 
 	if (still_time >= STILL_MIN_TIME) {
@@ -450,4 +484,17 @@ imu_pose_t imu_update(void)
 	}
 
 	return pose;
+}
+
+void imu_enable_dynamic_calibration(bool accel, bool gyro, bool mag)
+{
+	// P3 = 0: Configure ME Calibration subcommand
+	uint8_t params[9] = { accel, gyro, mag, 0 };
+	run_command(COMMAND_ME_CALIBRATION, params);
+}
+
+bool imu_save_calibration(void)
+{
+	uint8_t params[9] = { 0 };
+	return run_command(COMMAND_SAVE_DCD, params) == 0;
 }
