@@ -45,10 +45,13 @@
 #define SETTLE_TIME_S      1.0f  // let the sensor fusion converge before calibrating
 #define CALIBRATION_TIME_S 2.0f  // device at rest; averaged into the baseline
 
-// Stationary detection (zero-velocity update)
-#define STILL_MAX_ACCEL       0.2f   // m/s^2
+// Stationary detection (zero-velocity update). Uses only the raw accelerometer and the rotation
+// rate, never the gravity-subtracted acceleration, which a few degrees of tilt error corrupt.
+#define STILL_MAX_JITTER      0.1f   // m/s^2, raw reading vs its own short-term average
+#define STILL_MAX_G_ERROR     0.5f   // m/s^2, raw magnitude vs gravity (loose: axis scale errors)
 #define STILL_MAX_RATE        0.1f   // rad/s
-#define STILL_MIN_TIME        0.2f   // s both limits must hold before the device counts as stationary
+#define STILL_MIN_TIME        0.2f   // s all limits must hold before the device counts as stationary
+#define JITTER_SMOOTHING      0.1f   // per-sample weight of the short-term average
 #define GRAVITY_TRACKING_RATE 0.02f  // per-sample weight for re-measuring gravity while stationary
 
 typedef struct {
@@ -78,6 +81,7 @@ static quat_t heading_inverse;  // turns the world frame into the level frame
 static vec3_t gravity;          // accelerometer reading at rest, level frame (includes residual bias)
 static imu_pose_t pose;
 static vec3_t velocity, prev_accel;
+static vec3_t accel_average;  // short-term average of the raw reading, device frame
 static quat_t prev_orientation;
 static float still_time;
 
@@ -385,6 +389,7 @@ void imu_calibrate(void)
 	for (float t = 0; t < CALIBRATION_TIME_S; count++) {
 		imu_sample_t sample = next_sample();
 		t += sample.dt;
+		accel_average = sample.accel;
 
 		// q and -q are the same rotation; flip to agree with the running sum before adding
 		float sign = (quat_dot(orientation_sum, sample.orientation) < 0) ? -1.0f : 1.0f;
@@ -413,8 +418,9 @@ imu_pose_t imu_update(void)
 	float dt = sample.dt;
 	if (dt <= 0) { return pose; }
 
-	// Rotate the raw reading into the level frame and remove gravity there. Doing this with an
-	// orientation sampled at the same instant keeps gravity from leaking in while the device turns.
+	// Rotate the raw reading into the level frame and remove gravity there, using an orientation
+	// sampled at the same instant. The orientation's own tilt error (up to ~2.5 deg per the
+	// datasheet) still leaks about 0.17 m/s^2 of gravity per degree; that is the main drift source.
 	pose.orientation = quat_multiply(heading_inverse, sample.orientation);
 	vec3_t accel = vec_sub(quat_rotate(pose.orientation, sample.accel), gravity);
 
@@ -423,11 +429,16 @@ imu_pose_t imu_update(void)
 	float angular_rate = 2.0f * vec_length((vec3_t){ step.x, step.y, step.z }) / dt;
 	prev_orientation = sample.orientation;
 
-	bool still_now = vec_length(accel) < STILL_MAX_ACCEL && angular_rate < STILL_MAX_RATE;
+	accel_average = vec_add(accel_average, vec_scale(vec_sub(sample.accel, accel_average), JITTER_SMOOTHING));
+	float jitter = vec_length(vec_sub(sample.accel, accel_average));
+	float g_error = fabsf(vec_length(sample.accel) - vec_length(gravity));
+
+	bool still_now = jitter < STILL_MAX_JITTER && g_error < STILL_MAX_G_ERROR && angular_rate < STILL_MAX_RATE;
 	still_time = still_now ? still_time + dt : 0;
 
 	if (still_time >= STILL_MIN_TIME) {
-		// At rest the true velocity is zero and whatever is left is gravity/bias error; track it
+		// At rest the true velocity is zero and whatever is left is gravity/bias/tilt error;
+		// track it (this also follows the sensor as it slowly corrects its own tilt error)
 		velocity = prev_accel = (vec3_t){ 0 };
 		gravity = vec_add(gravity, vec_scale(accel, GRAVITY_TRACKING_RATE));
 	} else {
