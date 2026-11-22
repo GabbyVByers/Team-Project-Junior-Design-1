@@ -77,7 +77,11 @@ void app_main(void)
 
 	for (int n = 1; ; n++) {
 		imu_pose_t pose = imu_update();
-		vec3_t p = pose.position;
+
+		// Real position is temporarily disabled due to significant drift.
+		// For now, we'll assume position is always at the origin.
+		//vec3_t p = pose.position;
+		vec3_t p = (vec3_t){ 0.0f, 0.0f, 0.0f };
 		quat_t q = pose.orientation;
 
 		lidar_data_t lidar = lidar_read();
@@ -97,3 +101,4 @@ void app_main(void)
 		}
 	}
 }
+

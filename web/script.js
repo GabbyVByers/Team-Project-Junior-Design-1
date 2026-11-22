@@ -10,8 +10,8 @@ const CUBE   = 0.05;               // cube edge length
 const AXIS   = 0.15;               // axis line length
 const GRID   = 0.1;                // grid spacing
 const EXTENT = 5;                  // grid half-width (reads as an infinite plane)
-const CAMERA = [1.2, -1.6, 1.0];
-const TARGET = [0, 0, 0.25];
+const TARGET = [0, 0, 0.25];       // point the camera orbits around and looks at
+const PITCH  = 0.36;               // camera elevation above the horizon, radians
 const NEAR   = 0.05;
 const LIDAR_AXIS = [1, 0, 0];      // device axis the lidar points along (red = x, green = y, blue = z)
 
@@ -32,13 +32,21 @@ function rotate([w, ...u], v) {
 	return add(add(v, scale(t, w)), cross(u, t));
 }
 
-// Fixed camera basis
-const forward = unit(sub(TARGET, CAMERA));
-const right   = unit(cross(forward, [0, 0, 1]));
-const up      = cross(right, forward);
+// Orbit camera: spins about the vertical axis through TARGET (middle-drag), zooms with the wheel
+let cameraYaw = -0.93, cameraDistance = 2.1;
+let camera, forward, right, up;
+
+function updateCamera() {
+	const offset = [Math.cos(PITCH) * Math.cos(cameraYaw), Math.cos(PITCH) * Math.sin(cameraYaw), Math.sin(PITCH)];
+	camera  = add(TARGET, scale(offset, cameraDistance));
+	forward = scale(offset, -1);
+	right   = unit(cross(forward, [0, 0, 1]));
+	up      = cross(right, forward);
+}
+updateCamera();
 
 function toCamera(p) {
-	const d = sub(p, CAMERA);
+	const d = sub(p, camera);
 	return [dot(d, right), dot(d, up), dot(d, forward)];
 }
 
@@ -107,6 +115,28 @@ let points = [];
 let pose = [[0, 0, 0], [1, 0, 0, 0], null];
 draw(...pose);
 window.onresize = () => draw(...pose);
+
+// Middle-drag left/right spins the view about the vertical axis; the wheel zooms
+let spinning = false;
+canvas.addEventListener("mousedown", (e) => {
+	if (e.button === 1) {
+		spinning = true;
+		e.preventDefault();  // stop the browser's middle-click autoscroll
+	}
+});
+window.addEventListener("mouseup", (e) => { if (e.button === 1) spinning = false; });
+window.addEventListener("mousemove", (e) => {
+	if (!spinning) return;
+	cameraYaw -= e.movementX * 0.01;
+	updateCamera();
+	draw(...pose);
+});
+canvas.addEventListener("wheel", (e) => {
+	e.preventDefault();
+	cameraDistance = Math.min(Math.max(cameraDistance * Math.exp(e.deltaY * 0.001), 0.3), 20);
+	updateCamera();
+	draw(...pose);
+}, { passive: false });
 
 const ws = new WebSocket(`ws://${ESP32_IP}/ws`);
 ws.onopen    = () => status.textContent = "Connected";
