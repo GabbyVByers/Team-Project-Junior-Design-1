@@ -71,8 +71,7 @@ static vec3_t accel_bias;
 static imu_pose_t pose;
 static vec3_t velocity, prev_accel;
 static quat_t prev_orientation;
-static float still_time, motion_time;
-static bool moving;
+static float still_time;
 
 static quat_t quat_multiply(quat_t a, quat_t b)
 {
@@ -328,8 +327,7 @@ void imu_calibrate(void)
 	pose = (imu_pose_t){ .orientation = quat_multiply(heading_inverse, baseline) };
 	velocity = prev_accel = (vec3_t){ 0 };
 	prev_orientation = baseline;
-	still_time = motion_time = 0;
-	moving = false;
+	still_time = 0;
 }
 
 imu_pose_t imu_update(void)
@@ -349,24 +347,11 @@ imu_pose_t imu_update(void)
 	pose.orientation = quat_multiply(heading_inverse, sample.orientation);
 
 	if (still_time >= STILL_MIN_TIME) {
-		if (moving) {
-			// The true velocity is zero now, so whatever is left is integration error. Bias
-			// error grows velocity error linearly, so the position picked up half of it
-			// times the length of the motion; take that back out.
-			pose.position = vec_sub(pose.position, vec_scale(velocity, 0.5f * motion_time));
-			moving = false;
-		}
+		// At rest the true velocity is zero, and the measured linear acceleration is pure
+		// bias; track it as it drifts
 		velocity = prev_accel = (vec3_t){ 0 };
-
-		// At rest the measured linear acceleration is pure bias; track it as it drifts
 		accel_bias = vec_add(accel_bias, vec_scale(accel, BIAS_TRACKING_RATE));
 	} else {
-		if (!moving) {
-			moving = true;
-			motion_time = 0;
-		}
-		motion_time += dt;
-
 		// Trapezoidal integration in the level frame
 		vec3_t level_accel = quat_rotate(pose.orientation, accel);
 		vec3_t next_velocity = vec_add(velocity, vec_scale(vec_add(prev_accel, level_accel), 0.5f * dt));
