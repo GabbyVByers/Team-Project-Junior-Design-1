@@ -3,6 +3,33 @@
  *   Source [main.c]
  */
 
+/* -------------------- LIDAR -------------------- */
+
+#define LIDAR_DEMO
+#ifdef LIDAR_DEMO
+
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "lidar.h"
+
+void app_main(void)
+{
+  lidar_init();
+  
+  while (true) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+    printf("Distance: %d cm\n", lidar_read().distance_cm);
+  }
+}
+
+#endif /* LIDAR_DEMO */
+
+/* --------------------- WEB --------------------- */
+
+//#define WEB_DEMO
+#ifdef WEB_DEMO
+
 #include <stdio.h>
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"
@@ -108,3 +135,6 @@ void app_main(void)
     httpd_queue_work(server, send_counter, (void *)(intptr_t)counter++);
   }
 }
+
+#endif /* WEB_DEMO */
+
