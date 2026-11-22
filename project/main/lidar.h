@@ -7,9 +7,9 @@
 #define LIDAR_HEADER_GUARD
 
 typedef struct {
-  int distance_cm;
-  int amplitude;
-  float temp_c;
+	int distance_cm;
+	int amplitude;
+	float temp_c;
 } lidar_data_t;
 
 void lidar_init(void);

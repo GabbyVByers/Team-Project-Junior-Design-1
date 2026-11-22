@@ -4,6 +4,7 @@
  */
 
 #include "imu.h"
+#include <stdbool.h>
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -36,207 +37,208 @@
 #define REPORT_TIMESTAMP_REBASE    0xFA
 #define REPORT_BASE_TIMESTAMP      0xFB
 
-#define SIZE_LINEAR_ACCELERATION 10
-#define SIZE_GAME_ROTATION       12
-#define SIZE_TIMESTAMP           5
-
 #define QUEUE_SIZE 32
 
 static i2c_master_dev_handle_t device;
 static bool reset_done;
 
-static float qw = 1, qx, qy, qz;                         // latest orientation
+static quat_t latest_orientation = { 1, 0, 0, 0 };
 static uint32_t accel_interval_us = REPORT_INTERVAL_US;  // actual rate, from the hub's feature response
-static int last_accel_seq = -1;
+static int last_accel_sequence = -1;
 
-static imu_sample_t queue[QUEUE_SIZE];
+static imu_sample_t sample_queue[QUEUE_SIZE];
 static int queue_head, queue_count;
 
-static bool data_pending(void)
+static bool packet_pending(void)
 {
-  return gpio_get_level(PIN_INT) == 0;
+	return gpio_get_level(PIN_INT) == 0;
 }
 
-static float read_q(const uint8_t *bytes, int q)
+static float read_fixed_point(const uint8_t *bytes, int fraction_bits)
 {
-  int16_t raw = (int16_t)(bytes[0] | (bytes[1] << 8));
-  return (float)raw / (float)(1 << q);
+	int16_t raw = (int16_t)(bytes[0] | (bytes[1] << 8));
+	return (float)raw / (float)(1 << fraction_bits);
 }
 
-static void push_accel_sample(const uint8_t *r)
+static int report_size(uint8_t report_id)
 {
-  // Sequence numbers count every report the hub produced, so gaps from dropped
-  // reports still give the correct elapsed time
-  uint8_t seq = r[1];
-  uint8_t steps = (last_accel_seq < 0) ? 1 : (uint8_t)(seq - last_accel_seq);
-  last_accel_seq = seq;
+	switch (report_id) {
+	case REPORT_LINEAR_ACCELERATION: return 10;
+	case REPORT_GAME_ROTATION:       return 12;
+	case REPORT_TIMESTAMP_REBASE:
+	case REPORT_BASE_TIMESTAMP:      return 5;
+	default:                         return 0;
+	}
+}
 
-  if (queue_count == QUEUE_SIZE) { return; }
+static void queue_accel_sample(const uint8_t *report)
+{
+	// Sequence numbers count every report the hub produced, so gaps from dropped
+	// reports still give the correct elapsed time
+	uint8_t sequence = report[1];
+	uint8_t steps = (last_accel_sequence < 0) ? 1 : (uint8_t)(sequence - last_accel_sequence);
+	last_accel_sequence = sequence;
 
-  queue[(queue_head + queue_count++) % QUEUE_SIZE] = (imu_sample_t){
-    .w = qw, .x = qx, .y = qy, .z = qz,
-    .ax = read_q(&r[4], 8),
-    .ay = read_q(&r[6], 8),
-    .az = read_q(&r[8], 8),
-    .dt = steps * accel_interval_us * 1e-6f,
-  };
+	if (queue_count == QUEUE_SIZE) { return; }
+
+	sample_queue[(queue_head + queue_count++) % QUEUE_SIZE] = (imu_sample_t){
+		.orientation = latest_orientation,
+		.linear_accel = {
+			read_fixed_point(&report[4], 8),
+			read_fixed_point(&report[6], 8),
+			read_fixed_point(&report[8], 8),
+		},
+		.dt = steps * accel_interval_us * 1e-6f,
+	};
 }
 
 static void parse_reports(const uint8_t *data, int length)
 {
-  int i = 0;
-  while (i < length) {
-    const uint8_t *r = &data[i];
-    int size;
+	for (int i = 0; i < length; ) {
+		const uint8_t *report = &data[i];
+		int size = report_size(report[0]);
+		if (size == 0 || i + size > length) { return; }
 
-    switch (r[0]) {
-    case REPORT_BASE_TIMESTAMP:
-    case REPORT_TIMESTAMP_REBASE:
-      size = SIZE_TIMESTAMP;
-      break;
-    case REPORT_GAME_ROTATION:
-      size = SIZE_GAME_ROTATION;
-      if (i + size > length) { return; }
-      qx = read_q(&r[4],  14);
-      qy = read_q(&r[6],  14);
-      qz = read_q(&r[8],  14);
-      qw = read_q(&r[10], 14);
-      break;
-    case REPORT_LINEAR_ACCELERATION:
-      size = SIZE_LINEAR_ACCELERATION;
-      if (i + size > length) { return; }
-      push_accel_sample(r);
-      break;
-    default:
-      return;
-    }
+		if (report[0] == REPORT_GAME_ROTATION) {
+			latest_orientation = (quat_t){
+				.x = read_fixed_point(&report[4],  14),
+				.y = read_fixed_point(&report[6],  14),
+				.z = read_fixed_point(&report[8],  14),
+				.w = read_fixed_point(&report[10], 14),
+			};
+		} else if (report[0] == REPORT_LINEAR_ACCELERATION) {
+			queue_accel_sample(report);
+		}
 
-    i += size;
-  }
+		i += size;
+	}
 }
 
 static void parse_control(const uint8_t *data, int length)
 {
-  // The hub answers each Set Feature with the interval it actually chose
-  if (length >= 9 && data[0] == CMD_GET_FEATURE_RESPONSE && data[1] == REPORT_LINEAR_ACCELERATION) {
-    uint32_t interval = data[5] | (data[6] << 8) | (data[7] << 16) | ((uint32_t)data[8] << 24);
-    if (interval > 0) { accel_interval_us = interval; }
-  }
+	// The hub answers each Set Feature with the interval it actually chose
+	if (length >= 9 && data[0] == CMD_GET_FEATURE_RESPONSE && data[1] == REPORT_LINEAR_ACCELERATION) {
+		uint32_t interval = data[5] | (data[6] << 8) | (data[7] << 16) | ((uint32_t)data[8] << 24);
+		if (interval > 0) { accel_interval_us = interval; }
+	}
 }
 
 static void receive_packet(void)
 {
-  static uint8_t packet[SHTP_MAX_PACKET];
+	static uint8_t packet[SHTP_MAX_PACKET];
 
-  if (i2c_master_receive(device, packet, SHTP_HEADER_SIZE, I2C_TIMEOUT_MS) != ESP_OK) { return; }
+	if (i2c_master_receive(device, packet, SHTP_HEADER_SIZE, I2C_TIMEOUT_MS) != ESP_OK) { return; }
 
-  int length = (packet[0] | (packet[1] << 8)) & 0x7FFF;
-  if (length <= SHTP_HEADER_SIZE) { return; }
-  if (length > SHTP_MAX_PACKET) { length = SHTP_MAX_PACKET; }
+	int length = (packet[0] | (packet[1] << 8)) & 0x7FFF;
+	if (length <= SHTP_HEADER_SIZE) { return; }
+	if (length > SHTP_MAX_PACKET) { length = SHTP_MAX_PACKET; }
 
-  if (i2c_master_receive(device, packet, length, I2C_TIMEOUT_MS) != ESP_OK) { return; }
+	if (i2c_master_receive(device, packet, length, I2C_TIMEOUT_MS) != ESP_OK) { return; }
 
-  uint8_t channel = packet[2];
-  const uint8_t *payload = &packet[SHTP_HEADER_SIZE];
-  int payload_length = length - SHTP_HEADER_SIZE;
+	uint8_t channel = packet[2];
+	const uint8_t *payload = &packet[SHTP_HEADER_SIZE];
+	int payload_length = length - SHTP_HEADER_SIZE;
 
-  if (channel == CHANNEL_REPORTS) {
-    parse_reports(payload, payload_length);
-  } else if (channel == CHANNEL_CONTROL) {
-    parse_control(payload, payload_length);
-  } else if (channel == CHANNEL_EXECUTABLE && payload[0] == EXEC_RESET_DONE) {
-    reset_done = true;
-  }
+	if (channel == CHANNEL_REPORTS) {
+		parse_reports(payload, payload_length);
+	} else if (channel == CHANNEL_CONTROL) {
+		parse_control(payload, payload_length);
+	} else if (channel == CHANNEL_EXECUTABLE && payload[0] == EXEC_RESET_DONE) {
+		reset_done = true;
+	}
+}
+
+static void receive_or_wait(void)
+{
+	if (packet_pending()) {
+		receive_packet();
+	} else {
+		vTaskDelay(1);
+	}
 }
 
 static void enable_report(uint8_t report_id, uint32_t interval_us)
 {
-  static uint8_t sequence = 0;
-  uint8_t packet[SHTP_HEADER_SIZE + 17] = { 0 };
+	static uint8_t sequence = 0;
+	uint8_t packet[SHTP_HEADER_SIZE + 17] = { 0 };
 
-  packet[0] = sizeof(packet);
-  packet[2] = CHANNEL_CONTROL;
-  packet[3] = sequence++;
+	packet[0] = sizeof(packet);
+	packet[2] = CHANNEL_CONTROL;
+	packet[3] = sequence++;
 
-  uint8_t *cmd = &packet[SHTP_HEADER_SIZE];
-  cmd[0] = CMD_SET_FEATURE;
-  cmd[1] = report_id;
-  cmd[5] = interval_us & 0xFF;
-  cmd[6] = (interval_us >> 8) & 0xFF;
-  cmd[7] = (interval_us >> 16) & 0xFF;
-  cmd[8] = (interval_us >> 24) & 0xFF;
+	uint8_t *cmd = &packet[SHTP_HEADER_SIZE];
+	cmd[0] = CMD_SET_FEATURE;
+	cmd[1] = report_id;
+	cmd[5] = interval_us & 0xFF;
+	cmd[6] = (interval_us >> 8) & 0xFF;
+	cmd[7] = (interval_us >> 16) & 0xFF;
+	cmd[8] = (interval_us >> 24) & 0xFF;
 
-  i2c_master_transmit(device, packet, sizeof(packet), I2C_TIMEOUT_MS);
+	i2c_master_transmit(device, packet, sizeof(packet), I2C_TIMEOUT_MS);
 }
 
 static void setup_gpio(void)
 {
-  gpio_config_t reset_cfg = {
-    .pin_bit_mask = 1ULL << PIN_RESET,
-    .mode = GPIO_MODE_OUTPUT,
-  };
-  gpio_config(&reset_cfg);
+	gpio_config_t reset_cfg = {
+		.pin_bit_mask = 1ULL << PIN_RESET,
+		.mode = GPIO_MODE_OUTPUT,
+	};
+	gpio_config(&reset_cfg);
 
-  gpio_config_t int_cfg = {
-    .pin_bit_mask = 1ULL << PIN_INT,
-    .mode = GPIO_MODE_INPUT,
-    .pull_up_en = GPIO_PULLUP_ENABLE,
-  };
-  gpio_config(&int_cfg);
+	gpio_config_t int_cfg = {
+		.pin_bit_mask = 1ULL << PIN_INT,
+		.mode = GPIO_MODE_INPUT,
+		.pull_up_en = GPIO_PULLUP_ENABLE,
+	};
+	gpio_config(&int_cfg);
 }
 
 static void setup_i2c(void)
 {
-  i2c_master_bus_config_t bus_cfg = {
-    .i2c_port = I2C_NUM_0,
-    .sda_io_num = PIN_SDA,
-    .scl_io_num = PIN_SCL,
-    .clk_source = I2C_CLK_SRC_DEFAULT,
-    .glitch_ignore_cnt = 7,
-    .flags.enable_internal_pullup = true,
-  };
-  i2c_master_bus_handle_t bus;
-  ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &bus));
+	i2c_master_bus_config_t bus_cfg = {
+		.i2c_port = I2C_NUM_0,
+		.sda_io_num = PIN_SDA,
+		.scl_io_num = PIN_SCL,
+		.clk_source = I2C_CLK_SRC_DEFAULT,
+		.glitch_ignore_cnt = 7,
+		.flags.enable_internal_pullup = true,
+	};
+	i2c_master_bus_handle_t bus;
+	ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &bus));
 
-  i2c_device_config_t dev_cfg = {
-    .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-    .device_address = I2C_ADDRESS,
-    .scl_speed_hz = I2C_SPEED_HZ,
-  };
-  ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &dev_cfg, &device));
+	i2c_device_config_t dev_cfg = {
+		.dev_addr_length = I2C_ADDR_BIT_LEN_7,
+		.device_address = I2C_ADDRESS,
+		.scl_speed_hz = I2C_SPEED_HZ,
+	};
+	ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &dev_cfg, &device));
 }
 
 void imu_init(void)
 {
-  setup_gpio();
-  setup_i2c();
+	setup_gpio();
+	setup_i2c();
 
-  gpio_set_level(PIN_RESET, 0);
-  vTaskDelay(pdMS_TO_TICKS(10));
-  gpio_set_level(PIN_RESET, 1);
+	gpio_set_level(PIN_RESET, 0);
+	vTaskDelay(pdMS_TO_TICKS(10));
+	gpio_set_level(PIN_RESET, 1);
 
-  while (!reset_done) {
-    if (data_pending()) {
-      receive_packet();
-    } else {
-      vTaskDelay(1);
-    }
-  }
+	while (!reset_done) {
+		receive_or_wait();
+	}
 
-  enable_report(REPORT_GAME_ROTATION, REPORT_INTERVAL_US);
-  enable_report(REPORT_LINEAR_ACCELERATION, REPORT_INTERVAL_US);
+	enable_report(REPORT_GAME_ROTATION, REPORT_INTERVAL_US);
+	enable_report(REPORT_LINEAR_ACCELERATION, REPORT_INTERVAL_US);
 }
 
-bool imu_read(imu_sample_t *out)
+imu_sample_t imu_next_sample(void)
 {
-  while (data_pending()) {
-    receive_packet();
-  }
+	while (queue_count == 0) {
+		receive_or_wait();
+	}
 
-  if (queue_count == 0) { return false; }
-
-  *out = queue[queue_head];
-  queue_head = (queue_head + 1) % QUEUE_SIZE;
-  queue_count--;
-  return true;
+	imu_sample_t sample = sample_queue[queue_head];
+	queue_head = (queue_head + 1) % QUEUE_SIZE;
+	queue_count--;
+	return sample;
 }
