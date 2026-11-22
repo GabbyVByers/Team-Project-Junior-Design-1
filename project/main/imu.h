@@ -9,13 +9,15 @@
 typedef struct { float w, x, y, z; } quat_t;
 typedef struct { float x, y, z; } vec3_t;
 
+// Pose in the level frame: z is up, x points where the device's x axis pointed during
+// calibration, and the origin is where the device sat during calibration
 typedef struct {
-	quat_t orientation;   // device -> world (game rotation vector: gravity-aligned, no magnetometer)
-	vec3_t linear_accel;  // gravity removed, device frame, m/s^2
-	float dt;             // seconds since the previous sample, from the sensor's own sample clock
-} imu_sample_t;
+	vec3_t position;     // m
+	quat_t orientation;  // device -> level frame
+} imu_pose_t;
 
 void imu_init(void);
-imu_sample_t imu_next_sample(void);  // blocks until the next sample arrives
+void imu_calibrate(void);     // device must be at rest; blocks for a few seconds
+imu_pose_t imu_update(void);  // blocks for the next sample and returns the updated pose
 
 #endif /* IMU_HEADER_GUARD */
